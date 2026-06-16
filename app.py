@@ -2,7 +2,8 @@ from flask import Flask, request, render_template_string, redirect, url_for
 from flask_sqlalchemy import SQLAlchemy
 import requests
 import os
-from datetime import datetime
+import json
+from datetime import datetime, date
 
 app = Flask(__name__)
 
@@ -10,7 +11,6 @@ API_KEY = os.environ.get("API_KEY")
 
 database_url = os.environ.get("DATABASE_URL", "sqlite:///pricing.db")
 
-# Render / Heroku 有时会给 postgres://，SQLAlchemy 需要 postgresql://
 if database_url.startswith("postgres://"):
     database_url = database_url.replace("postgres://", "postgresql://", 1)
 
@@ -20,21 +20,40 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 
 
-class PricingRecord(db.Model):
+class SearchCache(db.Model):
+    __tablename__ = "search_cache_v1"
+
+    id = db.Column(db.Integer, primary_key=True)
+    keyword = db.Column(db.String(300), default="")
+    results_json = db.Column(db.Text, default="[]")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class ExchangeRate(db.Model):
+    __tablename__ = "exchange_rate_v1"
+
+    id = db.Column(db.Integer, primary_key=True)
+    rate_date = db.Column(db.String(20), unique=True, nullable=False)
+    usd_cny_rate = db.Column(db.Float, default=7.2)
+    source = db.Column(db.String(100), default="Frankfurter")
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class PricingRow(db.Model):
+    __tablename__ = "pricing_sheet_rows_v4"
+
     id = db.Column(db.Integer, primary_key=True)
 
     product_name = db.Column(db.String(300), default="")
     sku = db.Column(db.String(100), default="")
 
-    competitor_price = db.Column(db.Float, default=0)
-    product_cost_rmb = db.Column(db.Float, default=0)
-    exchange_rate = db.Column(db.Float, default=7.2)
-
-    package_cost_rmb = db.Column(db.Float, default=0)
-    domestic_shipping_rmb = db.Column(db.Float, default=0)
-
     weight_kg = db.Column(db.Float, default=0)
     volume_cbm = db.Column(db.Float, default=0)
+
+    product_cost_rmb = db.Column(db.Float, default=0)
+    exchange_rate = db.Column(db.Float, default=7.2)
+    package_cost_rmb = db.Column(db.Float, default=0)
+    domestic_shipping_rmb = db.Column(db.Float, default=0)
 
     air_price_rmb_per_kg = db.Column(db.Float, default=68)
     sea_price_rmb_per_cbm = db.Column(db.Float, default=0)
@@ -42,272 +61,41 @@ class PricingRecord(db.Model):
     us_last_mile_usd = db.Column(db.Float, default=0)
     warehouse_fee_usd = db.Column(db.Float, default=0)
 
-    platform_rate = db.Column(db.Float, default=0.15)
-    ad_rate = db.Column(db.Float, default=0)
-    creator_rate = db.Column(db.Float, default=0)
+    ad_fee_fixed_usd = db.Column(db.Float, default=0)
+    ad_fee_rate = db.Column(db.Float, default=0)
+
+    creator_fee_fixed_usd = db.Column(db.Float, default=0)
+    creator_fee_rate = db.Column(db.Float, default=0)
 
     return_rate = db.Column(db.Float, default=0)
     return_loss_usd = db.Column(db.Float, default=0)
 
-    target_price = db.Column(db.Float, default=0)
+    platform_fee_rate = db.Column(db.Float, default=0.15)
+    platform_fee_fixed_usd = db.Column(db.Float, default=0)
+
+    competitor_price_usd = db.Column(db.Float, default=0)
+    final_price_usd = db.Column(db.Float, default=0)
 
     air_cost_usd = db.Column(db.Float, default=0)
     sea_cost_usd = db.Column(db.Float, default=0)
     return_cost_usd = db.Column(db.Float, default=0)
 
-    breakeven_air_price = db.Column(db.Float, default=0)
-    breakeven_sea_price = db.Column(db.Float, default=0)
+    fixed_cost_air_usd = db.Column(db.Float, default=0)
+    fixed_cost_sea_usd = db.Column(db.Float, default=0)
 
-    profit_air = db.Column(db.Float, default=0)
-    profit_sea = db.Column(db.Float, default=0)
+    rate_fee_total = db.Column(db.Float, default=0)
 
-    profit_rate_air = db.Column(db.Float, default=0)
-    profit_rate_sea = db.Column(db.Float, default=0)
+    min_price_air_usd = db.Column(db.Float, default=0)
+    min_price_sea_usd = db.Column(db.Float, default=0)
 
     note = db.Column(db.String(500), default="")
+
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 
 with app.app_context():
     db.create_all()
-
-
-BASE_CSS = """
-<style>
-    body {
-        font-family: Arial, sans-serif;
-        padding: 30px;
-        background: #f6f6f6;
-    }
-
-    .nav {
-        margin-bottom: 25px;
-    }
-
-    .nav a {
-        display: inline-block;
-        margin-right: 12px;
-        padding: 8px 14px;
-        background: #111;
-        color: white;
-        text-decoration: none;
-        border-radius: 6px;
-        font-size: 14px;
-    }
-
-    h2 {
-        margin-bottom: 20px;
-    }
-
-    input, textarea {
-        padding: 7px 8px;
-        border: 1px solid #ccc;
-        border-radius: 5px;
-        font-size: 14px;
-        box-sizing: border-box;
-    }
-
-    button {
-        padding: 8px 14px;
-        border: none;
-        border-radius: 6px;
-        background: #111;
-        color: white;
-        cursor: pointer;
-        font-size: 14px;
-    }
-
-    .search-box {
-        margin-bottom: 25px;
-    }
-
-    .search-box input {
-        width: 380px;
-        height: 38px;
-    }
-
-    .summary {
-        margin-bottom: 20px;
-        color: #333;
-    }
-
-    .card {
-        display: flex;
-        gap: 18px;
-        background: #fff;
-        padding: 15px;
-        margin-bottom: 16px;
-        border-radius: 10px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-    }
-
-    .card img {
-        width: 130px;
-        height: 130px;
-        object-fit: cover;
-        border-radius: 8px;
-        background: #eee;
-        flex-shrink: 0;
-    }
-
-    .image-placeholder {
-        width: 130px;
-        height: 130px;
-        background: #ddd;
-        border-radius: 8px;
-        flex-shrink: 0;
-    }
-
-    .content {
-        flex: 1;
-    }
-
-    .title {
-        font-weight: bold;
-        font-size: 16px;
-        margin-bottom: 8px;
-        line-height: 1.4;
-    }
-
-    .title a {
-        color: #111;
-        text-decoration: none;
-    }
-
-    .title a:hover {
-        text-decoration: underline;
-    }
-
-    .meta {
-        color: #333;
-        margin-top: 6px;
-        font-size: 14px;
-    }
-
-    .price-row {
-        margin-top: 6px;
-        font-size: 14px;
-    }
-
-    .origin {
-        color: #777;
-        text-decoration: line-through;
-    }
-
-    .sale {
-        color: #d60000;
-        font-weight: bold;
-    }
-
-    .promo-tag {
-        display: inline-block;
-        background: #fff0f0;
-        color: #d60000;
-        padding: 3px 7px;
-        border-radius: 4px;
-        font-size: 13px;
-        margin-right: 6px;
-        margin-top: 4px;
-    }
-
-    .open-link {
-        display: inline-block;
-        margin-top: 10px;
-        padding: 6px 12px;
-        background: #111;
-        color: #fff;
-        text-decoration: none;
-        border-radius: 5px;
-        font-size: 14px;
-    }
-
-    .error {
-        color: #d60000;
-        background: #fff0f0;
-        padding: 12px;
-        border-radius: 6px;
-        margin-bottom: 20px;
-    }
-
-    .hint {
-        font-size: 13px;
-        color: #777;
-        margin-top: 4px;
-    }
-
-    .form-panel {
-        background: white;
-        padding: 18px;
-        border-radius: 10px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-        margin-bottom: 25px;
-    }
-
-    .grid {
-        display: grid;
-        grid-template-columns: repeat(4, 1fr);
-        gap: 12px;
-    }
-
-    .field label {
-        display: block;
-        font-size: 13px;
-        color: #333;
-        margin-bottom: 4px;
-    }
-
-    .field input {
-        width: 100%;
-    }
-
-    .field-wide {
-        grid-column: span 2;
-    }
-
-    .field-full {
-        grid-column: span 4;
-    }
-
-    table {
-        width: 100%;
-        border-collapse: collapse;
-        background: white;
-        font-size: 13px;
-    }
-
-    th, td {
-        border: 1px solid #ddd;
-        padding: 8px;
-        text-align: left;
-        vertical-align: top;
-    }
-
-    th {
-        background: #f0f0f0;
-        white-space: nowrap;
-    }
-
-    .num {
-        text-align: right;
-    }
-
-    .action-link {
-        display: inline-block;
-        margin-right: 6px;
-        color: #111;
-        text-decoration: underline;
-    }
-
-    .danger {
-        color: #d60000;
-    }
-
-    .small {
-        font-size: 12px;
-        color: #777;
-    }
-</style>
-"""
 
 
 def to_float(value, default=0):
@@ -320,15 +108,72 @@ def to_float(value, default=0):
 
 
 def percent_to_decimal(value, default=0):
-    """
-    支持两种输入：
-    15 表示 15%
-    0.15 也表示 15%
-    """
     number = to_float(value, default)
+
     if number > 1:
         return number / 100
+
     return number
+
+
+def percent_display(value):
+    if value is None:
+        return ""
+    return round(value * 100, 4)
+
+
+def money(value):
+    try:
+        return f"{float(value):.2f}"
+    except Exception:
+        return "0.00"
+
+
+def get_today_usd_cny_rate():
+    """
+    打开核价表时自动检查今日汇率。
+    如果今天数据库里没有汇率，就从 Frankfurter 获取 USD -> CNY。
+    如果接口失败，则使用最近一次保存的汇率；如果还没有，就用 7.2。
+    """
+    today_str = date.today().isoformat()
+
+    existing = ExchangeRate.query.filter_by(rate_date=today_str).first()
+    if existing:
+        return existing.usd_cny_rate, existing.rate_date, "数据库今日汇率"
+
+    latest = ExchangeRate.query.order_by(ExchangeRate.id.desc()).first()
+
+    try:
+        response = requests.get(
+            "https://api.frankfurter.dev/v1/latest",
+            params={
+                "base": "USD",
+                "symbols": "CNY"
+            },
+            timeout=15
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+            rate = float(data.get("rates", {}).get("CNY"))
+
+            new_rate = ExchangeRate(
+                rate_date=today_str,
+                usd_cny_rate=rate,
+                source="Frankfurter"
+            )
+
+            db.session.add(new_rate)
+            db.session.commit()
+
+            return rate, today_str, "今日自动更新"
+    except Exception:
+        pass
+
+    if latest:
+        return latest.usd_cny_rate, latest.rate_date, "使用最近一次汇率"
+
+    return 7.2, "默认", "使用默认汇率"
 
 
 def build_product_url(product_id, seo_url):
@@ -411,92 +256,436 @@ def fetch_competitor_data(keyword):
     return result[:10]
 
 
-def calculate_pricing(form):
-    product_cost_rmb = to_float(form.get("product_cost_rmb"))
-    exchange_rate = to_float(form.get("exchange_rate"), 7.2)
+def save_search_cache(keyword, results):
+    cache = SearchCache(
+        keyword=keyword,
+        results_json=json.dumps(results, ensure_ascii=False)
+    )
 
-    package_cost_rmb = to_float(form.get("package_cost_rmb"))
-    domestic_shipping_rmb = to_float(form.get("domestic_shipping_rmb"))
+    db.session.add(cache)
+    db.session.commit()
 
-    weight_kg = to_float(form.get("weight_kg"))
-    volume_cbm = to_float(form.get("volume_cbm"))
 
-    air_price_rmb_per_kg = to_float(form.get("air_price_rmb_per_kg"))
-    sea_price_rmb_per_cbm = to_float(form.get("sea_price_rmb_per_cbm"))
+def get_latest_keyword():
+    latest = SearchCache.query.order_by(SearchCache.id.desc()).first()
 
-    us_last_mile_usd = to_float(form.get("us_last_mile_usd"))
-    warehouse_fee_usd = to_float(form.get("warehouse_fee_usd"))
+    if latest:
+        return latest.keyword
 
-    platform_rate = percent_to_decimal(form.get("platform_rate"), 0.15)
-    ad_rate = percent_to_decimal(form.get("ad_rate"), 0)
-    creator_rate = percent_to_decimal(form.get("creator_rate"), 0)
+    return ""
 
-    return_rate = percent_to_decimal(form.get("return_rate"), 0)
-    return_loss_usd = to_float(form.get("return_loss_usd"))
 
-    target_price = to_float(form.get("target_price"))
-    competitor_price = to_float(form.get("competitor_price"))
+def get_cached_results(keyword):
+    if not keyword:
+        return None
 
-    air_cost_usd = 0
-    sea_cost_usd = 0
+    cache = (
+        SearchCache.query
+        .filter_by(keyword=keyword)
+        .order_by(SearchCache.id.desc())
+        .first()
+    )
 
-    if exchange_rate > 0:
-        air_cost_usd = weight_kg * air_price_rmb_per_kg / exchange_rate
-        sea_cost_usd = volume_cbm * sea_price_rmb_per_cbm / exchange_rate
+    if not cache:
+        return None
 
-    return_cost_usd = return_rate * return_loss_usd
+    try:
+        return json.loads(cache.results_json)
+    except Exception:
+        return None
 
-    rmb_fixed_cost_usd = 0
-    if exchange_rate > 0:
-        rmb_fixed_cost_usd = (product_cost_rmb + package_cost_rmb + domestic_shipping_rmb) / exchange_rate
 
-    variable_rate = platform_rate + ad_rate + creator_rate
+def compute_row(row):
+    exchange_rate = row.exchange_rate or 0
 
-    fixed_air = rmb_fixed_cost_usd + air_cost_usd + us_last_mile_usd + warehouse_fee_usd + return_cost_usd
-    fixed_sea = rmb_fixed_cost_usd + sea_cost_usd + us_last_mile_usd + warehouse_fee_usd + return_cost_usd
+    if exchange_rate <= 0:
+        row.air_cost_usd = 0
+        row.sea_cost_usd = 0
+        row.return_cost_usd = 0
+        row.fixed_cost_air_usd = 0
+        row.fixed_cost_sea_usd = 0
+        row.rate_fee_total = 0
+        row.min_price_air_usd = 0
+        row.min_price_sea_usd = 0
+        return row
 
-    if variable_rate >= 1:
-        breakeven_air_price = 0
-        breakeven_sea_price = 0
+    row.air_cost_usd = (
+        (row.weight_kg or 0)
+        * (row.air_price_rmb_per_kg or 0)
+        / exchange_rate
+    )
+
+    row.sea_cost_usd = (
+        (row.volume_cbm or 0)
+        * (row.sea_price_rmb_per_cbm or 0)
+        / exchange_rate
+    )
+
+    row.return_cost_usd = (
+        (row.return_rate or 0)
+        * (row.return_loss_usd or 0)
+    )
+
+    rmb_cost_usd = (
+        (row.product_cost_rmb or 0)
+        + (row.package_cost_rmb or 0)
+        + (row.domestic_shipping_rmb or 0)
+    ) / exchange_rate
+
+    row.fixed_cost_air_usd = (
+        rmb_cost_usd
+        + (row.us_last_mile_usd or 0)
+        + (row.warehouse_fee_usd or 0)
+        + (row.ad_fee_fixed_usd or 0)
+        + (row.creator_fee_fixed_usd or 0)
+        + (row.platform_fee_fixed_usd or 0)
+        + (row.air_cost_usd or 0)
+        + (row.return_cost_usd or 0)
+    )
+
+    row.fixed_cost_sea_usd = (
+        rmb_cost_usd
+        + (row.us_last_mile_usd or 0)
+        + (row.warehouse_fee_usd or 0)
+        + (row.ad_fee_fixed_usd or 0)
+        + (row.creator_fee_fixed_usd or 0)
+        + (row.platform_fee_fixed_usd or 0)
+        + (row.sea_cost_usd or 0)
+        + (row.return_cost_usd or 0)
+    )
+
+    row.rate_fee_total = (
+        (row.ad_fee_rate or 0)
+        + (row.creator_fee_rate or 0)
+        + (row.platform_fee_rate or 0)
+    )
+
+    if row.rate_fee_total >= 1:
+        row.min_price_air_usd = 0
+        row.min_price_sea_usd = 0
     else:
-        breakeven_air_price = fixed_air / (1 - variable_rate)
-        breakeven_sea_price = fixed_sea / (1 - variable_rate)
+        row.min_price_air_usd = row.fixed_cost_air_usd / (1 - row.rate_fee_total)
+        row.min_price_sea_usd = row.fixed_cost_sea_usd / (1 - row.rate_fee_total)
 
-    final_target_price = target_price or competitor_price
+    row.updated_at = datetime.utcnow()
 
-    profit_air = 0
-    profit_sea = 0
-    profit_rate_air = 0
-    profit_rate_sea = 0
+    return row
 
-    if final_target_price > 0:
-        profit_air = final_target_price * (1 - variable_rate) - fixed_air
-        profit_sea = final_target_price * (1 - variable_rate) - fixed_sea
-        profit_rate_air = profit_air / final_target_price
-        profit_rate_sea = profit_sea / final_target_price
 
-    return {
-        "air_cost_usd": air_cost_usd,
-        "sea_cost_usd": sea_cost_usd,
-        "return_cost_usd": return_cost_usd,
-        "breakeven_air_price": breakeven_air_price,
-        "breakeven_sea_price": breakeven_sea_price,
-        "profit_air": profit_air,
-        "profit_sea": profit_sea,
-        "profit_rate_air": profit_rate_air,
-        "profit_rate_sea": profit_rate_sea,
-        "platform_rate": platform_rate,
-        "ad_rate": ad_rate,
-        "creator_rate": creator_rate,
-        "return_rate": return_rate
+def set_row_from_form(row, prefix):
+    row.product_name = request.form.get(prefix + "product_name", "").strip()
+    row.sku = request.form.get(prefix + "sku", "").strip()
+
+    row.weight_kg = to_float(request.form.get(prefix + "weight_kg"))
+    row.volume_cbm = to_float(request.form.get(prefix + "volume_cbm"))
+
+    row.product_cost_rmb = to_float(request.form.get(prefix + "product_cost_rmb"))
+    row.exchange_rate = to_float(request.form.get(prefix + "exchange_rate"), 7.2)
+
+    row.package_cost_rmb = to_float(request.form.get(prefix + "package_cost_rmb"))
+    row.domestic_shipping_rmb = to_float(request.form.get(prefix + "domestic_shipping_rmb"))
+
+    row.air_price_rmb_per_kg = to_float(request.form.get(prefix + "air_price_rmb_per_kg"))
+    row.sea_price_rmb_per_cbm = to_float(request.form.get(prefix + "sea_price_rmb_per_cbm"))
+
+    row.us_last_mile_usd = to_float(request.form.get(prefix + "us_last_mile_usd"))
+    row.warehouse_fee_usd = to_float(request.form.get(prefix + "warehouse_fee_usd"))
+
+    row.ad_fee_fixed_usd = to_float(request.form.get(prefix + "ad_fee_fixed_usd"))
+    row.ad_fee_rate = percent_to_decimal(request.form.get(prefix + "ad_fee_rate"))
+
+    row.creator_fee_fixed_usd = to_float(request.form.get(prefix + "creator_fee_fixed_usd"))
+    row.creator_fee_rate = percent_to_decimal(request.form.get(prefix + "creator_fee_rate"))
+
+    row.return_rate = percent_to_decimal(request.form.get(prefix + "return_rate"))
+    row.return_loss_usd = to_float(request.form.get(prefix + "return_loss_usd"))
+
+    row.platform_fee_rate = percent_to_decimal(request.form.get(prefix + "platform_fee_rate"), 0.15)
+    row.platform_fee_fixed_usd = to_float(request.form.get(prefix + "platform_fee_fixed_usd"))
+
+    row.competitor_price_usd = to_float(request.form.get(prefix + "competitor_price_usd"))
+    row.final_price_usd = to_float(request.form.get(prefix + "final_price_usd"))
+
+    row.note = request.form.get(prefix + "note", "").strip()
+
+    compute_row(row)
+
+    return row
+
+
+def new_row_has_content():
+    fields = [
+        "new_product_name",
+        "new_sku",
+        "new_competitor_price_usd",
+        "new_final_price_usd",
+        "new_product_cost_rmb",
+        "new_note"
+    ]
+
+    for field in fields:
+        if request.form.get(field, "").strip():
+            return True
+
+    return False
+
+
+BASE_CSS = """
+<style>
+    body {
+        font-family: Arial, sans-serif;
+        padding: 24px;
+        background: #f6f6f6;
+        color: #111;
     }
+
+    .nav {
+        margin-bottom: 20px;
+    }
+
+    .nav a {
+        display: inline-block;
+        margin-right: 10px;
+        padding: 8px 14px;
+        background: #111;
+        color: #fff;
+        text-decoration: none;
+        border-radius: 6px;
+        font-size: 14px;
+    }
+
+    h2 {
+        margin-bottom: 18px;
+    }
+
+    input {
+        padding: 6px 8px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        font-size: 13px;
+        box-sizing: border-box;
+    }
+
+    button {
+        padding: 7px 12px;
+        border: none;
+        border-radius: 5px;
+        background: #111;
+        color: #fff;
+        cursor: pointer;
+        font-size: 13px;
+    }
+
+    .search-box {
+        margin-bottom: 22px;
+    }
+
+    .search-box input {
+        width: 380px;
+        height: 38px;
+        font-size: 15px;
+    }
+
+    .summary {
+        margin-bottom: 18px;
+        color: #333;
+    }
+
+    .card {
+        display: flex;
+        gap: 18px;
+        background: #fff;
+        padding: 15px;
+        margin-bottom: 16px;
+        border-radius: 10px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+    }
+
+    .card img {
+        width: 130px;
+        height: 130px;
+        object-fit: cover;
+        border-radius: 8px;
+        background: #eee;
+        flex-shrink: 0;
+    }
+
+    .image-placeholder {
+        width: 130px;
+        height: 130px;
+        background: #ddd;
+        border-radius: 8px;
+        flex-shrink: 0;
+    }
+
+    .content {
+        flex: 1;
+    }
+
+    .title {
+        font-weight: bold;
+        font-size: 16px;
+        margin-bottom: 8px;
+        line-height: 1.4;
+    }
+
+    .title a {
+        color: #111;
+        text-decoration: none;
+    }
+
+    .title a:hover {
+        text-decoration: underline;
+    }
+
+    .meta {
+        color: #333;
+        margin-top: 6px;
+        font-size: 14px;
+    }
+
+    .price-row {
+        margin-top: 6px;
+        font-size: 14px;
+    }
+
+    .origin {
+        color: #777;
+        text-decoration: line-through;
+    }
+
+    .sale {
+        color: #d60000;
+        font-weight: bold;
+    }
+
+    .promo-tag {
+        display: inline-block;
+        background: #fff0f0;
+        color: #d60000;
+        padding: 3px 7px;
+        border-radius: 4px;
+        font-size: 13px;
+        margin-right: 6px;
+        margin-top: 4px;
+    }
+
+    .error {
+        color: #d60000;
+        background: #fff0f0;
+        padding: 12px;
+        border-radius: 6px;
+        margin-bottom: 18px;
+    }
+
+    .hint {
+        font-size: 13px;
+        color: #777;
+        margin-top: 5px;
+        margin-bottom: 12px;
+    }
+
+    .rate-box {
+        background: #fff;
+        border-radius: 8px;
+        padding: 10px 12px;
+        margin-bottom: 14px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        font-size: 13px;
+    }
+
+    .table-wrap {
+        background: #fff;
+        border-radius: 10px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        overflow-x: auto;
+        max-width: 100%;
+    }
+
+    table {
+        border-collapse: collapse;
+        min-width: 3300px;
+        width: 3300px;
+        background: #fff;
+        font-size: 12px;
+    }
+
+    th, td {
+        border: 1px solid #ddd;
+        padding: 6px;
+        text-align: left;
+        vertical-align: middle;
+        white-space: nowrap;
+    }
+
+    th {
+        background: #f0f0f0;
+        position: sticky;
+        top: 0;
+        z-index: 1;
+    }
+
+    td input {
+        width: 100%;
+        min-width: 90px;
+        border: 1px solid #ddd;
+        padding: 5px;
+        font-size: 12px;
+    }
+
+    .w-name input {
+        min-width: 220px;
+    }
+
+    .w-note input {
+        min-width: 220px;
+    }
+
+    .readonly {
+        background: #f8f8f8;
+        color: #333;
+        font-weight: bold;
+    }
+
+    .toolbar {
+        margin: 12px 0;
+    }
+
+    .toolbar button {
+        margin-right: 8px;
+    }
+
+    .delete-btn {
+        background: #d60000;
+    }
+
+    .pagination {
+        margin-top: 14px;
+    }
+
+    .pagination a {
+        display: inline-block;
+        margin-right: 8px;
+        padding: 7px 12px;
+        background: #111;
+        color: #fff;
+        text-decoration: none;
+        border-radius: 5px;
+    }
+
+    .small {
+        font-size: 12px;
+        color: #777;
+    }
+</style>
+"""
 
 
 COMPETITOR_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>TikTok竞品分析工具</title>
+    <title>TikTok竞品搜索</title>
     <meta charset="utf-8">
     """ + BASE_CSS + """
 </head>
@@ -504,18 +693,21 @@ COMPETITOR_HTML = """
 <body>
 
     <div class="nav">
-        <a href="/">竞品搜索</a>
+        <a href="/{% if keyword %}?keyword={{ keyword }}{% endif %}">竞品搜索</a>
         <a href="/pricing">核价表</a>
     </div>
 
-    <h2>TikTok Shop 竞品 Top10 分析工具</h2>
+    <h2>TikTok Shop 竞品 Top10 搜索</h2>
 
     <div class="search-box">
-        <form method="post">
+        <form method="get" action="/">
             <input name="keyword" placeholder="输入英文关键词，例如 dog grooming brush" value="{{ keyword or '' }}">
             <button type="submit">搜索</button>
+            {% if keyword %}
+                <a href="/?keyword={{ keyword }}&refresh=1" style="margin-left:10px;">重新请求API刷新</a>
+            {% endif %}
         </form>
-        <div class="hint">点击商品图片、商品名称或“打开商品”按钮，可跳转 TikTok 商品页。部分商品可能因地区、登录状态或 TikTok Web 限制无法直达。</div>
+        <div class="hint">点击商品图片或商品名称，可跳转 TikTok 商品页。切到核价表后，再点竞品搜索，会保留最近一次关键词和结果。</div>
     </div>
 
     {% if error %}
@@ -590,12 +782,6 @@ COMPETITOR_HTML = """
                             -
                         {% endif %}
                     </div>
-
-                    {% if r.product_url %}
-                        <a class="open-link" href="{{ r.product_url }}" target="_blank" rel="noopener noreferrer">
-                            打开商品
-                        </a>
-                    {% endif %}
                 </div>
 
             </div>
@@ -619,207 +805,199 @@ PRICING_HTML = """
 <body>
 
     <div class="nav">
-        <a href="/">竞品搜索</a>
+        <a href="/{% if latest_keyword %}?keyword={{ latest_keyword }}{% endif %}">竞品搜索</a>
         <a href="/pricing">核价表</a>
     </div>
 
     <h2>核价表</h2>
 
-    <div class="form-panel">
-        <h3>{% if edit_record %}编辑核价记录{% else %}新增核价记录{% endif %}</h3>
-
-        <form method="post" action="{% if edit_record %}/pricing/update/{{ edit_record.id }}{% else %}/pricing/add{% endif %}">
-
-            <div class="grid">
-
-                <div class="field field-wide">
-                    <label>商品名称</label>
-                    <input name="product_name" value="{{ edit_record.product_name if edit_record else '' }}">
-                </div>
-
-                <div class="field">
-                    <label>SKU</label>
-                    <input name="sku" value="{{ edit_record.sku if edit_record else '' }}">
-                </div>
-
-                <div class="field">
-                    <label>参考竞品价 USD</label>
-                    <input name="competitor_price" value="{{ edit_record.competitor_price if edit_record else '' }}">
-                </div>
-
-                <div class="field">
-                    <label>商品进价 RMB</label>
-                    <input name="product_cost_rmb" value="{{ edit_record.product_cost_rmb if edit_record else '' }}">
-                </div>
-
-                <div class="field">
-                    <label>汇率</label>
-                    <input name="exchange_rate" value="{{ edit_record.exchange_rate if edit_record else '7.2' }}">
-                </div>
-
-                <div class="field">
-                    <label>包装耗材 RMB</label>
-                    <input name="package_cost_rmb" value="{{ edit_record.package_cost_rmb if edit_record else '' }}">
-                </div>
-
-                <div class="field">
-                    <label>国内物流 RMB</label>
-                    <input name="domestic_shipping_rmb" value="{{ edit_record.domestic_shipping_rmb if edit_record else '' }}">
-                </div>
-
-                <div class="field">
-                    <label>重量 kg</label>
-                    <input name="weight_kg" value="{{ edit_record.weight_kg if edit_record else '' }}">
-                </div>
-
-                <div class="field">
-                    <label>体积 m³</label>
-                    <input name="volume_cbm" value="{{ edit_record.volume_cbm if edit_record else '' }}">
-                </div>
-
-                <div class="field">
-                    <label>空运单价 RMB/kg</label>
-                    <input name="air_price_rmb_per_kg" value="{{ edit_record.air_price_rmb_per_kg if edit_record else '68' }}">
-                </div>
-
-                <div class="field">
-                    <label>海运单价 RMB/m³</label>
-                    <input name="sea_price_rmb_per_cbm" value="{{ edit_record.sea_price_rmb_per_cbm if edit_record else '' }}">
-                </div>
-
-                <div class="field">
-                    <label>US尾程运费 USD</label>
-                    <input name="us_last_mile_usd" value="{{ edit_record.us_last_mile_usd if edit_record else '' }}">
-                </div>
-
-                <div class="field">
-                    <label>海外仓操作费 USD</label>
-                    <input name="warehouse_fee_usd" value="{{ edit_record.warehouse_fee_usd if edit_record else '' }}">
-                </div>
-
-                <div class="field">
-                    <label>平台佣金 %</label>
-                    <input name="platform_rate" value="{{ (edit_record.platform_rate * 100) if edit_record else '15' }}">
-                </div>
-
-                <div class="field">
-                    <label>广告费 %</label>
-                    <input name="ad_rate" value="{{ (edit_record.ad_rate * 100) if edit_record else '' }}">
-                </div>
-
-                <div class="field">
-                    <label>达人佣金 %</label>
-                    <input name="creator_rate" value="{{ (edit_record.creator_rate * 100) if edit_record else '' }}">
-                </div>
-
-                <div class="field">
-                    <label>退货率 %</label>
-                    <input name="return_rate" value="{{ (edit_record.return_rate * 100) if edit_record else '' }}">
-                </div>
-
-                <div class="field">
-                    <label>单次退货损失 USD</label>
-                    <input name="return_loss_usd" value="{{ edit_record.return_loss_usd if edit_record else '' }}">
-                </div>
-
-                <div class="field">
-                    <label>目标售价 USD</label>
-                    <input name="target_price" value="{{ edit_record.target_price if edit_record else '' }}">
-                </div>
-
-                <div class="field field-full">
-                    <label>备注</label>
-                    <input name="note" value="{{ edit_record.note if edit_record else '' }}">
-                </div>
-
-            </div>
-
-            <br>
-
-            <button type="submit">{% if edit_record %}保存修改{% else %}新增并保存{% endif %}</button>
-
-            {% if edit_record %}
-                <a class="action-link" href="/pricing">取消编辑</a>
-            {% endif %}
-
-        </form>
+    <div class="rate-box">
+        今日默认汇率 USD→CNY：<b>{{ money(today_rate) }}</b>
+        ｜汇率日期：{{ rate_date }}
+        ｜状态：{{ rate_status }}
+        <br>
+        <span class="small">说明：系统会在打开核价表时检查当天汇率。已有历史行的汇率不会被强制覆盖，避免旧核价结果被自动改动。</span>
     </div>
 
-    <h3>已保存核价记录</h3>
+    <div class="hint">
+        直接在表格里填写。竞品价格和自己的最终定价都手动填写。灰色列为公式自动计算列。每页显示 {{ per_page }} 条。
+    </div>
 
-    <table>
-        <thead>
-            <tr>
-                <th>ID</th>
-                <th>商品</th>
-                <th>SKU</th>
-                <th>竞品价</th>
-                <th>进价RMB</th>
-                <th>最低不亏价-空运</th>
-                <th>最低不亏价-海运</th>
-                <th>目标售价</th>
-                <th>利润-空运</th>
-                <th>利润率-空运</th>
-                <th>利润-海运</th>
-                <th>利润率-海运</th>
-                <th>备注</th>
-                <th>时间</th>
-                <th>操作</th>
-            </tr>
-        </thead>
+    <form method="post" action="/pricing/save?page={{ page.page }}">
+        <div class="toolbar">
+            <button type="submit">保存当前页修改 / 新增行</button>
+        </div>
 
-        <tbody>
-            {% for r in records %}
-                <tr>
-                    <td>{{ r.id }}</td>
-                    <td>{{ r.product_name }}</td>
-                    <td>{{ r.sku }}</td>
-                    <td class="num">${{ "%.2f"|format(r.competitor_price or 0) }}</td>
-                    <td class="num">{{ "%.2f"|format(r.product_cost_rmb or 0) }}</td>
-                    <td class="num">${{ "%.2f"|format(r.breakeven_air_price or 0) }}</td>
-                    <td class="num">${{ "%.2f"|format(r.breakeven_sea_price or 0) }}</td>
-                    <td class="num">${{ "%.2f"|format(r.target_price or 0) }}</td>
-                    <td class="num">${{ "%.2f"|format(r.profit_air or 0) }}</td>
-                    <td class="num">{{ "%.1f"|format((r.profit_rate_air or 0) * 100) }}%</td>
-                    <td class="num">${{ "%.2f"|format(r.profit_sea or 0) }}</td>
-                    <td class="num">{{ "%.1f"|format((r.profit_rate_sea or 0) * 100) }}%</td>
-                    <td>{{ r.note }}</td>
-                    <td class="small">{{ r.created_at.strftime("%Y-%m-%d %H:%M") if r.created_at else "" }}</td>
-                    <td>
-                        <a class="action-link" href="/pricing/edit/{{ r.id }}">编辑</a>
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>产品名称</th>
+                        <th>SKU码</th>
+                        <th>重量kg</th>
+                        <th>体积m³</th>
+                        <th>产品成本RMB</th>
+                        <th>汇率</th>
+                        <th>包装耗材RMB</th>
+                        <th>国内物流RMB</th>
+                        <th>空运单价RMB/kg</th>
+                        <th>海运单价RMB/m³</th>
+                        <th>US尾程运费USD</th>
+                        <th>海外仓操作费USD</th>
+                        <th>广告费固定USD</th>
+                        <th>广告费百分比%</th>
+                        <th>达人佣金固定USD</th>
+                        <th>达人佣金百分比%</th>
+                        <th>退货率%</th>
+                        <th>单次退货损失USD</th>
+                        <th>平台佣金百分比%</th>
+                        <th>平台佣金固定USD</th>
+                        <th>竞品价格USD</th>
+                        <th>自己的最终定价USD</th>
+                        <th class="readonly">最低成本价-空运USD</th>
+                        <th class="readonly">最低成本价-海运USD</th>
+                        <th>备注</th>
+                        <th>更新时间</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
 
-                        <form method="post" action="/pricing/delete/{{ r.id }}" style="display:inline;">
-                            <button class="danger" type="submit" onclick="return confirm('确认删除这条记录？')">删除</button>
-                        </form>
-                    </td>
-                </tr>
-            {% endfor %}
-        </tbody>
-    </table>
+                <tbody>
+                    <tr>
+                        <td>新增</td>
+                        <td class="w-name"><input name="new_product_name"></td>
+                        <td><input name="new_sku"></td>
+                        <td><input name="new_weight_kg"></td>
+                        <td><input name="new_volume_cbm"></td>
+                        <td><input name="new_product_cost_rmb"></td>
+                        <td><input name="new_exchange_rate" value="{{ money(today_rate) }}"></td>
+                        <td><input name="new_package_cost_rmb"></td>
+                        <td><input name="new_domestic_shipping_rmb"></td>
+                        <td><input name="new_air_price_rmb_per_kg" value="68"></td>
+                        <td><input name="new_sea_price_rmb_per_cbm"></td>
+                        <td><input name="new_us_last_mile_usd"></td>
+                        <td><input name="new_warehouse_fee_usd"></td>
+                        <td><input name="new_ad_fee_fixed_usd"></td>
+                        <td><input name="new_ad_fee_rate"></td>
+                        <td><input name="new_creator_fee_fixed_usd"></td>
+                        <td><input name="new_creator_fee_rate"></td>
+                        <td><input name="new_return_rate"></td>
+                        <td><input name="new_return_loss_usd"></td>
+                        <td><input name="new_platform_fee_rate" value="15"></td>
+                        <td><input name="new_platform_fee_fixed_usd"></td>
+                        <td><input name="new_competitor_price_usd"></td>
+                        <td><input name="new_final_price_usd"></td>
+                        <td class="readonly">自动</td>
+                        <td class="readonly">自动</td>
+                        <td class="w-note"><input name="new_note"></td>
+                        <td>-</td>
+                        <td>新增后保存</td>
+                    </tr>
+
+                    {% for r in page.items %}
+                        <tr>
+                            <td>
+                                {{ r.id }}
+                                <input type="hidden" name="row_ids" value="{{ r.id }}">
+                            </td>
+
+                            <td class="w-name"><input name="row_{{ r.id }}_product_name" value="{{ r.product_name or '' }}"></td>
+                            <td><input name="row_{{ r.id }}_sku" value="{{ r.sku or '' }}"></td>
+                            <td><input name="row_{{ r.id }}_weight_kg" value="{{ r.weight_kg or '' }}"></td>
+                            <td><input name="row_{{ r.id }}_volume_cbm" value="{{ r.volume_cbm or '' }}"></td>
+                            <td><input name="row_{{ r.id }}_product_cost_rmb" value="{{ r.product_cost_rmb or '' }}"></td>
+                            <td><input name="row_{{ r.id }}_exchange_rate" value="{{ r.exchange_rate or '' }}"></td>
+                            <td><input name="row_{{ r.id }}_package_cost_rmb" value="{{ r.package_cost_rmb or '' }}"></td>
+                            <td><input name="row_{{ r.id }}_domestic_shipping_rmb" value="{{ r.domestic_shipping_rmb or '' }}"></td>
+                            <td><input name="row_{{ r.id }}_air_price_rmb_per_kg" value="{{ r.air_price_rmb_per_kg or '' }}"></td>
+                            <td><input name="row_{{ r.id }}_sea_price_rmb_per_cbm" value="{{ r.sea_price_rmb_per_cbm or '' }}"></td>
+                            <td><input name="row_{{ r.id }}_us_last_mile_usd" value="{{ r.us_last_mile_usd or '' }}"></td>
+                            <td><input name="row_{{ r.id }}_warehouse_fee_usd" value="{{ r.warehouse_fee_usd or '' }}"></td>
+                            <td><input name="row_{{ r.id }}_ad_fee_fixed_usd" value="{{ r.ad_fee_fixed_usd or '' }}"></td>
+                            <td><input name="row_{{ r.id }}_ad_fee_rate" value="{{ percent_display(r.ad_fee_rate) }}"></td>
+                            <td><input name="row_{{ r.id }}_creator_fee_fixed_usd" value="{{ r.creator_fee_fixed_usd or '' }}"></td>
+                            <td><input name="row_{{ r.id }}_creator_fee_rate" value="{{ percent_display(r.creator_fee_rate) }}"></td>
+                            <td><input name="row_{{ r.id }}_return_rate" value="{{ percent_display(r.return_rate) }}"></td>
+                            <td><input name="row_{{ r.id }}_return_loss_usd" value="{{ r.return_loss_usd or '' }}"></td>
+                            <td><input name="row_{{ r.id }}_platform_fee_rate" value="{{ percent_display(r.platform_fee_rate) }}"></td>
+                            <td><input name="row_{{ r.id }}_platform_fee_fixed_usd" value="{{ r.platform_fee_fixed_usd or '' }}"></td>
+                            <td><input name="row_{{ r.id }}_competitor_price_usd" value="{{ r.competitor_price_usd or '' }}"></td>
+                            <td><input name="row_{{ r.id }}_final_price_usd" value="{{ r.final_price_usd or '' }}"></td>
+
+                            <td class="readonly">${{ money(r.min_price_air_usd) }}</td>
+                            <td class="readonly">${{ money(r.min_price_sea_usd) }}</td>
+
+                            <td class="w-note"><input name="row_{{ r.id }}_note" value="{{ r.note or '' }}"></td>
+                            <td class="small">{{ r.updated_at.strftime("%Y-%m-%d %H:%M") if r.updated_at else "" }}</td>
+
+                            <td>
+                                <button
+                                    class="delete-btn"
+                                    type="submit"
+                                    formaction="/pricing/delete/{{ r.id }}?page={{ page.page }}"
+                                    formmethod="post"
+                                    onclick="return confirm('确认删除这条记录？')"
+                                >
+                                    删除
+                                </button>
+                            </td>
+                        </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+
+        <div class="toolbar">
+            <button type="submit">保存当前页修改 / 新增行</button>
+        </div>
+    </form>
+
+    <div class="pagination">
+        {% if page.has_prev %}
+            <a href="/pricing?page={{ page.prev_num }}">上一页</a>
+        {% endif %}
+
+        <span>第 {{ page.page }} 页 / 共 {{ page.pages }} 页，共 {{ page.total }} 条</span>
+
+        {% if page.has_next %}
+            <a href="/pricing?page={{ page.next_num }}">下一页</a>
+        {% endif %}
+    </div>
 
 </body>
 </html>
 """
 
 
-@app.route("/", methods=["GET", "POST"])
+@app.route("/", methods=["GET"])
 def competitor_search():
     results = None
     error = None
-    keyword = ""
 
-    if request.method == "POST":
-        keyword = request.form.get("keyword", "").strip()
+    keyword = request.args.get("keyword", "").strip()
+    refresh = request.args.get("refresh", "")
 
-        if not keyword:
-            error = "请输入关键词"
-        else:
-            try:
+    if not keyword:
+        keyword = get_latest_keyword()
+
+    if keyword:
+        try:
+            if refresh == "1":
                 results = fetch_competitor_data(keyword)
-                if not results:
-                    error = "没有搜索到商品数据，请换一个关键词"
-            except Exception as e:
-                error = str(e)
+                save_search_cache(keyword, results)
+            else:
+                results = get_cached_results(keyword)
+
+                if results is None:
+                    results = fetch_competitor_data(keyword)
+                    save_search_cache(keyword, results)
+
+            if not results:
+                error = "没有搜索到商品数据，请换一个关键词"
+
+        except Exception as e:
+            error = str(e)
 
     return render_template_string(
         COMPETITOR_HTML,
@@ -831,143 +1009,60 @@ def competitor_search():
 
 @app.route("/pricing", methods=["GET"])
 def pricing():
-    records = PricingRecord.query.order_by(PricingRecord.id.desc()).all()
+    page_num = request.args.get("page", 1, type=int)
+    per_page = 10
+
+    today_rate, rate_date, rate_status = get_today_usd_cny_rate()
+
+    query = db.select(PricingRow).order_by(PricingRow.id.desc())
+    page = db.paginate(query, page=page_num, per_page=per_page, error_out=False)
+
+    latest_keyword = get_latest_keyword()
 
     return render_template_string(
         PRICING_HTML,
-        records=records,
-        edit_record=None
+        page=page,
+        per_page=per_page,
+        latest_keyword=latest_keyword,
+        today_rate=today_rate,
+        rate_date=rate_date,
+        rate_status=rate_status,
+        money=money,
+        percent_display=percent_display
     )
 
 
-@app.route("/pricing/add", methods=["POST"])
-def add_pricing_record():
-    form = request.form
-    calc = calculate_pricing(form)
+@app.route("/pricing/save", methods=["POST"])
+def pricing_save():
+    page_num = request.args.get("page", 1, type=int)
 
-    record = PricingRecord(
-        product_name=form.get("product_name", "").strip(),
-        sku=form.get("sku", "").strip(),
+    row_ids = request.form.getlist("row_ids")
 
-        competitor_price=to_float(form.get("competitor_price")),
-        product_cost_rmb=to_float(form.get("product_cost_rmb")),
-        exchange_rate=to_float(form.get("exchange_rate"), 7.2),
+    for row_id in row_ids:
+        row = PricingRow.query.get(int(row_id))
 
-        package_cost_rmb=to_float(form.get("package_cost_rmb")),
-        domestic_shipping_rmb=to_float(form.get("domestic_shipping_rmb")),
+        if row:
+            set_row_from_form(row, f"row_{row.id}_")
 
-        weight_kg=to_float(form.get("weight_kg")),
-        volume_cbm=to_float(form.get("volume_cbm")),
-
-        air_price_rmb_per_kg=to_float(form.get("air_price_rmb_per_kg")),
-        sea_price_rmb_per_cbm=to_float(form.get("sea_price_rmb_per_cbm")),
-
-        us_last_mile_usd=to_float(form.get("us_last_mile_usd")),
-        warehouse_fee_usd=to_float(form.get("warehouse_fee_usd")),
-
-        platform_rate=calc["platform_rate"],
-        ad_rate=calc["ad_rate"],
-        creator_rate=calc["creator_rate"],
-
-        return_rate=calc["return_rate"],
-        return_loss_usd=to_float(form.get("return_loss_usd")),
-
-        target_price=to_float(form.get("target_price")),
-
-        air_cost_usd=calc["air_cost_usd"],
-        sea_cost_usd=calc["sea_cost_usd"],
-        return_cost_usd=calc["return_cost_usd"],
-
-        breakeven_air_price=calc["breakeven_air_price"],
-        breakeven_sea_price=calc["breakeven_sea_price"],
-
-        profit_air=calc["profit_air"],
-        profit_sea=calc["profit_sea"],
-        profit_rate_air=calc["profit_rate_air"],
-        profit_rate_sea=calc["profit_rate_sea"],
-
-        note=form.get("note", "").strip()
-    )
-
-    db.session.add(record)
-    db.session.commit()
-
-    return redirect(url_for("pricing"))
-
-
-@app.route("/pricing/edit/<int:record_id>", methods=["GET"])
-def edit_pricing_record(record_id):
-    edit_record = PricingRecord.query.get_or_404(record_id)
-    records = PricingRecord.query.order_by(PricingRecord.id.desc()).all()
-
-    return render_template_string(
-        PRICING_HTML,
-        records=records,
-        edit_record=edit_record
-    )
-
-
-@app.route("/pricing/update/<int:record_id>", methods=["POST"])
-def update_pricing_record(record_id):
-    record = PricingRecord.query.get_or_404(record_id)
-    form = request.form
-    calc = calculate_pricing(form)
-
-    record.product_name = form.get("product_name", "").strip()
-    record.sku = form.get("sku", "").strip()
-
-    record.competitor_price = to_float(form.get("competitor_price"))
-    record.product_cost_rmb = to_float(form.get("product_cost_rmb"))
-    record.exchange_rate = to_float(form.get("exchange_rate"), 7.2)
-
-    record.package_cost_rmb = to_float(form.get("package_cost_rmb"))
-    record.domestic_shipping_rmb = to_float(form.get("domestic_shipping_rmb"))
-
-    record.weight_kg = to_float(form.get("weight_kg"))
-    record.volume_cbm = to_float(form.get("volume_cbm"))
-
-    record.air_price_rmb_per_kg = to_float(form.get("air_price_rmb_per_kg"))
-    record.sea_price_rmb_per_cbm = to_float(form.get("sea_price_rmb_per_cbm"))
-
-    record.us_last_mile_usd = to_float(form.get("us_last_mile_usd"))
-    record.warehouse_fee_usd = to_float(form.get("warehouse_fee_usd"))
-
-    record.platform_rate = calc["platform_rate"]
-    record.ad_rate = calc["ad_rate"]
-    record.creator_rate = calc["creator_rate"]
-
-    record.return_rate = calc["return_rate"]
-    record.return_loss_usd = to_float(form.get("return_loss_usd"))
-
-    record.target_price = to_float(form.get("target_price"))
-
-    record.air_cost_usd = calc["air_cost_usd"]
-    record.sea_cost_usd = calc["sea_cost_usd"]
-    record.return_cost_usd = calc["return_cost_usd"]
-
-    record.breakeven_air_price = calc["breakeven_air_price"]
-    record.breakeven_sea_price = calc["breakeven_sea_price"]
-
-    record.profit_air = calc["profit_air"]
-    record.profit_sea = calc["profit_sea"]
-
-    record.profit_rate_air = calc["profit_rate_air"]
-    record.profit_rate_sea = calc["profit_rate_sea"]
-
-    record.note = form.get("note", "").strip()
+    if new_row_has_content():
+        new_row = PricingRow()
+        set_row_from_form(new_row, "new_")
+        db.session.add(new_row)
 
     db.session.commit()
 
-    return redirect(url_for("pricing"))
+    return redirect(url_for("pricing", page=page_num))
 
 
-@app.route("/pricing/delete/<int:record_id>", methods=["POST"])
-def delete_pricing_record(record_id):
-    record = PricingRecord.query.get_or_404(record_id)
-    db.session.delete(record)
+@app.route("/pricing/delete/<int:row_id>", methods=["POST"])
+def pricing_delete(row_id):
+    page_num = request.args.get("page", 1, type=int)
+
+    row = PricingRow.query.get_or_404(row_id)
+    db.session.delete(row)
     db.session.commit()
 
-    return redirect(url_for("pricing"))
+    return redirect(url_for("pricing", page=page_num))
 
 
 if __name__ == "__main__":
