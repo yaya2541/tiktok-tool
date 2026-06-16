@@ -91,6 +91,15 @@ HTML = """
             line-height: 1.4;
         }
 
+        .title a {
+            color: #111;
+            text-decoration: none;
+        }
+
+        .title a:hover {
+            text-decoration: underline;
+        }
+
         .meta {
             color: #333;
             margin-top: 6px;
@@ -130,6 +139,12 @@ HTML = """
             border-radius: 6px;
             margin-bottom: 20px;
         }
+
+        .hint {
+            font-size: 13px;
+            color: #777;
+            margin-top: 4px;
+        }
     </style>
 </head>
 
@@ -142,6 +157,7 @@ HTML = """
             <input name="keyword" placeholder="输入英文关键词，例如 dog grooming brush" value="{{ keyword or '' }}">
             <button type="submit">搜索</button>
         </form>
+        <div class="hint">点击商品图片或商品名称，可跳转到 TikTok 商品页。</div>
     </div>
 
     {% if error %}
@@ -156,19 +172,36 @@ HTML = """
         {% for r in results %}
             <div class="card">
 
-                {% if r.image %}
-                    <img src="{{ r.image }}">
+                {% if r.product_url %}
+                    <a href="{{ r.product_url }}" target="_blank">
+                        {% if r.image %}
+                            <img src="{{ r.image }}">
+                        {% else %}
+                            <div class="image-placeholder"></div>
+                        {% endif %}
+                    </a>
                 {% else %}
-                    <div class="image-placeholder"></div>
+                    {% if r.image %}
+                        <img src="{{ r.image }}">
+                    {% else %}
+                        <div class="image-placeholder"></div>
+                    {% endif %}
                 {% endif %}
 
                 <div class="content">
-                    <div class="title">{{ loop.index }}. {{ r.title }}</div>
+                    <div class="title">
+                        {{ loop.index }}.
+                        {% if r.product_url %}
+                            <a href="{{ r.product_url }}" target="_blank">{{ r.title }}</a>
+                        {% else %}
+                            {{ r.title }}
+                        {% endif %}
+                    </div>
 
                     <div class="meta">销量：{{ r.sold }}</div>
 
                     <div class="price-row">
-                        日常价：
+                        竞品日常价：
                         {% if r.origin_price %}
                             <span class="origin">${{ r.origin_price }}</span>
                         {% else %}
@@ -177,7 +210,7 @@ HTML = """
                     </div>
 
                     <div class="price-row">
-                        活动价 / 当前价：
+                        竞品当前标价：
                         {% if r.sale_price %}
                             <span class="sale">${{ r.sale_price }}</span>
                         {% else %}
@@ -186,7 +219,7 @@ HTML = """
                     </div>
 
                     <div class="price-row">
-                        促销信息：
+                        折扣信息：
                         {% if r.discount %}
                             <span class="promo-tag">{{ r.discount }}</span>
                         {% endif %}
@@ -242,23 +275,25 @@ def fetch_data(keyword):
         price_info = p.get("product_price_info") or {}
         sold_info = p.get("sold_info") or {}
         image_info = p.get("image") or {}
+        seo_url = p.get("seo_url") or {}
 
         title = p.get("title", "")
         sold = sold_info.get("sold_count", 0)
 
-        # 日常价 / 原价
+        # 竞品日常价 / 原价 / 划线价
         origin_price = price_info.get("origin_price_decimal", "")
 
-        # 活动价 / 当前展示价
+        # 竞品当前标价 / 当前展示价
         sale_price = price_info.get("sale_price_decimal", "")
 
-        # 促销信息：折扣与节省金额
-        # 说明：这不是严格意义上的“券后价”，而是当前 Search 接口里能稳定拿到的促销展示信息
+        # 折扣信息：只作为参考，不等同于最终到手价
         discount = price_info.get("discount_format", "")
         saving = price_info.get("reduce_price_format", "")
 
         image_list = image_info.get("url_list") or []
         image = image_list[0] if image_list else ""
+
+        product_url = seo_url.get("canonical_url", "")
 
         result.append({
             "title": title,
@@ -267,7 +302,8 @@ def fetch_data(keyword):
             "sale_price": sale_price,
             "discount": discount,
             "saving": saving,
-            "image": image
+            "image": image,
+            "product_url": product_url
         })
 
     result.sort(key=lambda x: x["sold"], reverse=True)
